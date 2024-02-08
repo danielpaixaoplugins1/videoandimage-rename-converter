@@ -1,0 +1,161 @@
+<?php
+/**
+ * Plugin Name: WPCM Video and Image Rename
+ * Description: Renomeia vídeos e imagens enviados, convertendo imagens para WebP (exceto GIFs), redimensionando imagens grandes, mantendo a relação de aspecto, e aplica medidas de segurança. Os vídeos são salvos em uma pasta separada por data. As imagens são renomeadas com a data e ID da postagem e convertidas para WebP quando apropriado.
+ * Version: 1.0
+ * Author: Daniel Oliveira da Paixão
+ */
+
+if (!defined('ABSPATH')) exit; // Exit if accessed directly
+
+add_filter('wp_handle_upload_prefilter', 'wpcm_change_media_upload_dir');
+add_action('add_attachment', 'wpcm_rename_uploaded_media');
+add_filter('wp_handle_upload', 'converte_para_webp');
+
+function wpcm_change_media_upload_dir($file) {
+    $upload_dir = wp_upload_dir();
+    $file_type = wp_check_filetype($file['name']);
+
+    if (strpos($file_type['type'], 'video') !== false) {
+        $date_path = date('Y/m/d');
+        $custom_dir = '/videos/' . $date_path;
+
+        if (!file_exists($upload_dir['basedir'] . $custom_dir)) {
+            wp_mkdir_p($upload_dir['basedir'] . $custom_dir);
+        }
+
+        add_filter('upload_dir', function ($dirs) use ($custom_dir, $upload_dir) {
+            $dirs['path'] = $upload_dir['basedir'] . $custom_dir;
+            $dirs['url'] = $upload_dir['baseurl'] . $custom_dir;
+            $dirs['subdir'] = $custom_dir;
+            return $dirs;
+        });
+    }
+
+    return $file;
+}
+
+function wpcm_rename_uploaded_media($attachment_id) {
+    $attachment = get_post($attachment_id);
+    $file_path = get_attached_file($attachment_id);
+    $file_type = wp_check_filetype($attachment->guid);
+    $path_info = pathinfo($file_path);
+    $new_filename = '';
+
+    if (strpos($file_type['type'], 'video') !== false) {
+        $new_filename = 'video-' . date('Ymd') . '-' . $attachment_id . '.' . $path_info['extension'];
+    } else if (strpos($file_type['type'], 'image') !== false) {
+        $new_filename = 'image-' . date('Ymd') . '-' . $attachment_id . '.' . $path_info['extension'];
+        // Atualiza o título e o atributo "alt" da imagem
+        $new_title = sanitize_title(get_bloginfo('name')); // Título seguro do site sem o TLD
+        wp_update_post(array(
+            'ID' => $attachment_id,
+            'post_title' => $new_title,
+            'post_excerpt' => $new_title // Atualiza também o atributo "alt" da imagem
+        ));
+    }
+
+    if ($new_filename) {
+        $new_filepath = $path_info['dirname'] . '/' . $new_filename;
+
+        if (!file_exists($new_filepath)) {
+            if (rename($file_path, $new_filepath)) {
+                wp_update_post([
+                    'ID' => $attachment_id,
+                    'guid' => str_replace(basename($attachment->guid), $new_filename, $attachment->guid)
+                ]);
+                update_attached_file($attachment_id, $new_filepath);
+            } else {
+                error_log("WPCM Video and Image Rename: Falha ao renomear o arquivo $file_path");
+            }
+        } else {
+            error_log("WPCM Video and Image Rename: O arquivo $new_filepath já existe.");
+        }
+    }
+
+    // Remove o filtro para não afetar outros uploads
+    if (strpos($file_type['type'], 'video') !== false) {
+        remove_filter('upload_dir', 'wpcm_change_media_upload_dir');
+    }
+}
+
+function converte_para_webp($file) {
+    $valid_image_types = ['image/jpeg', 'image/png'];
+    if (in_array($file['type'], $valid_image_types)) {
+        $image_path = $file['file'];
+        $image_extension = strtolower(pathinfo($image_path, PATHINFO_EXTENSION));
+
+        list($width, $height) = getimagesize($image_path);
+        if ($width === false || $height === false) {
+            error_log("Imagem inválida ou corrompida: {$image_path}");
+            return $file;
+        }
+
+        ini_set('memory_limit', '256M');
+
+        $image = null;
+        switch ($image_extension) {
+            case 'jpeg':
+            case 'jpg':
+                $image = @imagecreatefromjpeg($image_path);
+                break;
+            case 'png':
+                $image = @imagecreatefrompng($image_path);
+                break;
+        }
+
+        if (!$image) {
+            error_log("Falha ao carregar a imagem: {$image_path}");
+            return $file;
+        }
+
+        $image = redimensionar_imagem($image, 1200);
+        $novo_nome = renomear_imagem($file['name']);
+        $webp_path = pathinfo($image_path, PATHINFO_DIRNAME) . '/' . sanitize_file_name($novo_nome);
+
+        if (!imagewebp($image, $webp_path)) {
+            error_log("Falha ao converter a imagem para WebP: {$image_path}");
+            imagedestroy($image);
+            return $file;
+        }
+
+        imagedestroy($image);
+
+        $file['file'] = $webp_path;
+        $file['type'] = 'image/webp';
+        $file['name'] = $novo_nome;
+    }
+
+    return $file;
+}
+
+function redimensionar_imagem($image, $max_dimensao) {
+    $largura = imagesx($image);
+    $altura = imagesy($image);
+
+    if ($largura > $max_dimensao || $altura > $max_dimensao) {
+        $ratio = $largura / $altura;
+        if ($ratio > 1) {
+            $nova_largura = $max_dimensao;
+            $nova_altura = $max_dimensao / $ratio;
+        } else {
+            $nova_altura = $max_dimensao;
+            $nova_largura = $max_dimensao * $ratio;
+        }
+
+        $nova_imagem = imagecreatetruecolor($nova_largura, $nova_altura);
+        imagecopyresampled($nova_imagem, $image, 0, 0, 0, 0, $nova_largura, $nova_altura, $largura, $altura);
+
+        return $nova_imagem;
+    }
+
+    return $image;
+}
+
+function renomear_imagem($nome_original) {
+    $extensao = '.webp';
+    $novo_nome = 'imagem' . time() . $extensao;
+    return $novo_nome;
+}
+
+// A função my_post_save_rename_image pode ser implementada para necessidades específicas, se necessário.
